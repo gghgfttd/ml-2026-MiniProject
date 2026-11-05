@@ -2,134 +2,169 @@
 
 **Course:** Machine Learning, National University of Kyiv-Mohyla Academy  
 **Project type:** Empirical regression study  
-**Target:** Hourly bike-sharing demand (`cnt`)
+**Target:** Hourly bike rental count (`cnt`)
 
 ## 1. Project Overview
 
-This project investigates how well different machine-learning approaches predict the number of bike rentals per hour using the UCI Bike Sharing dataset.
+This project studies how the choice of validation strategy affects the estimated predictive performance of machine-learning models on hourly bike-sharing data.
 
-The goal is not simply to obtain the lowest prediction error. It is to conduct a reproducible empirical investigation, justify the modelling and validation choices, compare the resulting experiments, and analyse where and why the models make errors.
+The central research question is:
 
-A central question of the project is:
+> **How does estimated model performance change under random, blocked, and chronological validation, and does the size of this difference depend on the model family?**
 
-> How do estimates of predictive performance change when hourly bike-sharing data are evaluated with random, blocked, and chronological validation, and does this difference depend on the model family?
+The motivation is that hourly observations are not independent in time. Demand has daily and weekly patterns, and its overall level changes between 2011 and 2012. A random split can therefore evaluate a different task from predicting genuinely later observations: its training data may contain observations later than those in its test fold.
 
-The project also examines whether a logarithmic target transformation or a Poisson loss changes the prediction-error profile.
+We compare three validation strategies and examine the resulting performance estimates, model errors, and systematic prediction patterns. We also test whether a logarithmic target transformation or a Poisson loss changes the error profile.
 
-## 2. Dataset
+**This is a supervised regression study with time-aware evaluation, not a lag-based time-series forecasting model.** The main experiments use calendar and weather features; they do not use previous rental counts (`cnt`) as input features.
 
-The project uses the **hourly** file (`data/hour.csv`) from the [UCI Bike Sharing Dataset](https://archive.ics.uci.edu/dataset/275/bike+sharing+dataset). It contains hourly rental counts in Washington, D.C., for 2011–2012, together with calendar and weather-related features.
+## 2. Dataset and Preprocessing
 
-- **Target:** `cnt`, the total number of bike rentals in an hour.
+The project uses the hourly file (`data/hour.csv`) from the [UCI Bike Sharing Dataset](https://archive.ics.uci.edu/dataset/275/bike+sharing+dataset).
+
 - **Observations:** 17,379 recorded hours.
 - **Time coverage:** 2011–2012.
-- **Prediction task:** regression of hourly rental counts.
+- **Location:** Washington, D.C.
+- **Target:** `cnt`, the total number of rentals in an hour.
+- **Task:** regression of hourly rental counts.
 
-The preprocessing and feature-selection decisions are documented in `01_eda.ipynb` and implemented centrally in `src/data.py`.
+The preprocessing decisions are documented in `01_eda.ipynb` and implemented in `src/data.py`:
 
-In particular, variables that directly reveal the target (`casual` and `registered`) are excluded to avoid target leakage. The timestamp is used as the index, and the observations are sorted chronologically. The year indicator is excluded from the main modelling experiments so that the models do not directly use the 2011/2012 label.
+- `casual` and `registered` are removed because their sum gives the target `cnt` exactly; retaining them would cause target leakage.
+- `instant` and `dteday` are not used as predictors. A timestamp is constructed and used to sort and index the observations chronologically.
+- The year indicator `yr` is excluded from the main experiments, so models do not receive the 2011/2012 label directly.
+- `atemp` and `season` are excluded from the main feature set; `temp` is retained.
+- The 22 zero values in `hum` are treated as missing values.
+- The three observations with `weathersit == 4` are grouped with category 3.
+- Missing timestamps are not filled with invented rental counts.
 
-The dataset contains some missing timestamps and 22 zero values in `hum`, which are treated as missing by the shared data loader. Missing timestamps are not silently filled with synthetic rental counts.
+The shared loader provides nine predictors: `hr`, `mnth`, `weekday`, `holiday`, `workingday`, `weathersit`, `temp`, `hum`, and `windspeed`.
 
-## 3. Repository Structure
+## 3. Experimental Design
+
+### Baselines
+
+Two reference models establish a simple performance benchmark:
+
+1. **Constant baseline:** predicts the mean rental count in the training fold.
+2. **Hour × day-type baseline:** predicts the training-fold mean for the corresponding hour and day type, falling back to the training mean for an unseen combination.
+
+Baseline predictions are calculated using the training portion of each fold; test-fold target values are not used to construct them.
+
+### Candidate models
+
+The project compares three model families, with two alternative variants in two of those families:
+
+| Model family | Variants | What is examined |
+|---|---|---|
+| Ridge Regression | `ridge`, `ridge_log` | Regularised linear regression, with and without a `log1p` transformation of the target. |
+| Random Forest | `rf` | A tree-ensemble model that can capture nonlinear relationships and feature interactions. |
+| Histogram-based Gradient Boosting | `hgb`, `hgb_poisson` | Boosted trees trained with squared-error and Poisson losses. |
+
+The variants are not counted as separate model families. The comparison therefore covers three families and five candidate-model variants, in addition to the two baselines.
+
+### Model-specific preprocessing
+
+Preprocessing is fitted within the relevant training fold:
+
+- **Ridge:** categorical encoding, numerical imputation and scaling, a quadratic temperature feature, and an hour-by-working-day interaction. The `ridge_log` variant applies `log1p` to the target during fitting and transforms predictions back with `expm1`.
+- **Random Forest:** tree-based model without feature scaling or one-hot encoding; missing humidity values are imputed within the pipeline.
+- **HistGradientBoosting:** uses categorical features and native handling of missing values. Automatic early stopping is disabled to avoid introducing an additional random internal validation split into the time-ordered experiments.
+
+The exact transformations and hyperparameter grids are documented in the corresponding notebooks.
+
+## 4. Validation Strategy
+
+The shared implementation in `src/validation.py` provides three schemes:
+
+1. **Random K-Fold:** observations are shuffled before being divided into folds. A training fold can contain observations later in time than observations in its test fold.
+2. **Blocked K-Fold:** observations remain in chronological order and each test fold is a contiguous block. However, the training fold contains observations both before and after that block. It is therefore not a simulation of forecasting only into the future.
+3. **Chronological expanding-window validation:** the first 50% of the time span is used as the initial training period. The remaining time span is divided into five consecutive test periods of equal calendar duration. Each fold is trained only on observations earlier than its test period.
+
+### Nested cross-validation
+
+For experiments with hyperparameter tuning, the evaluation uses two nested loops:
+
+- The **outer loop** estimates performance. It uses five splits and keeps each outer test fold out of the corresponding model-selection process.
+- The **inner loop** selects hyperparameters using only the outer training data. It uses three splits with the same validation scheme as the outer loop.
+
+For each outer fold, the search selects hyperparameters from the inner validation results and refits the selected estimator on the full outer training set. The refitted estimator is then evaluated on the untouched outer test fold. This process is repeated for all five outer folds.
+
+The chronological scheme is the primary evaluation setting because the intended use is prediction for later time periods. Random and blocked validation are included to investigate how alternative split designs change the reported performance.
+
+**Important distinction:** the inner validation folds select hyperparameters; the outer test folds estimate the performance of the model-selection procedure. The chronological outer test predictions cover 8,722 recorded hours in 2012. The initial chronological training period is not part of those outer test predictions.
+
+## 5. Evaluation Metrics
+
+The experiments report four regression metrics:
+
+- **RMSE (Root Mean Squared Error):** measured in rentals per hour; penalises large errors more strongly. It is the primary hyperparameter-search metric.
+- **MAE (Mean Absolute Error):** average absolute prediction error, measured in rentals per hour.
+- **R²:** compares the model's squared prediction error with the error of predicting the mean target value in the evaluated sample.
+- **RMSLE (Root Mean Squared Logarithmic Error):** measures errors on a logarithmic scale and gives a complementary view of relative errors across demand levels.
+
+Negative predictions are retained when calculating RMSE, MAE, and R². For RMSLE only, negative predictions are clipped to zero before applying the logarithm. The frequency of negative predictions is analysed separately.
+
+## 6. Main Results
+
+### Performance on the same 2012 timestamps
+
+To make the validation schemes easier to compare, the global analysis also evaluates predictions on the **same 8,722 chronological test timestamps in 2012**. The target observations are aligned across schemes and models. This makes the evaluated hours comparable, but **does not make the training sets identical**: random and blocked validation may use observations later than a given test timestamp, while chronological validation may use only earlier observations.
+
+The table reports RMSE in rentals per hour:
+
+| Model | Random | Blocked | Chronological |
+|---|---:|---:|---:|
+| Constant baseline | 213.8 | 219.0 | 220.9 |
+| Hour × day-type baseline | 120.0 | 134.0 | 139.4 |
+| Ridge | 96.3 | 126.6 | 128.7 |
+| Ridge (`log1p` target) | 94.3 | 136.2 | 129.1 |
+| Random Forest | 71.3 | 120.5 | **117.6** |
+| HistGradientBoosting (squared error) | 68.3 | 119.0 | 121.3 |
+| HistGradientBoosting (Poisson) | **67.2** | 121.2 | 121.9 |
+
+The main findings are:
+
+- Random validation gives substantially lower RMSE than chronological validation for the learned models. For example, the Random Forest RMSE rises from **71.3** under random validation to **117.6** under chronological validation; for the two boosting variants, it rises from **68.3 to 121.3** and from **67.2 to 121.9**, respectively.
+- The size of this difference varies by model. It is comparatively small for the constant baseline (+3%) and larger for the learned models: +34% for Ridge, +65% for Random Forest, +78% for squared-error boosting, and +81% for Poisson boosting. Percentages are calculated relative to the random-validation RMSE on the matched timestamps.
+- Most of the increase appears between random and blocked validation. Blocked and chronological RMSE are much closer in this matched comparison, although the schemes still represent different training information and prediction settings.
+- **Random Forest has the lowest chronological RMSE (117.6)** among the evaluated candidate models. It improves on the hour × day-type baseline (139.4) by approximately **15.6%** in RMSE on the matched 2012 evaluation.
+- Poisson loss gives a lower chronological RMSLE than squared-error boosting, but it does not improve chronological RMSE in this experiment (121.9 versus 121.3).
+
+These results support the central conclusion: validation design materially affects the performance estimate, and the size of the effect is model-dependent. Random validation is not an appropriate estimate of performance when the intended task is prediction on later, unseen time periods.
+
+### Error analysis
+
+The comparison notebook also examines residuals and prediction errors by time, demand level, and weather. A recurring pattern is underprediction during high-demand working-day peaks. For the tree-based models, peak-hour RMSE is substantially higher than off-peak RMSE. This indicates that good overall average performance does not mean that the models predict the busiest hours equally well.
+
+The notebooks contain additional diagnostics, including fold-level variation, negative predictions, unusually large errors, and performance across weather conditions. These analyses are descriptive; they do not establish causal explanations for demand changes.
+
+## 7. Repository Structure
 
 ```text
 ml-2026-MiniProject/
 ├── data/
 │   └── hour.csv
 ├── figures/                         # Generated plots
-├── results/                         # Saved fold metrics and out-of-fold predictions
+├── results/                         # Fold metrics and out-of-fold predictions
 ├── src/
 │   ├── data.py                      # Shared data loading and preprocessing
-│   └── validation.py                # Shared splitters, metrics, and evaluation routine
+│   └── validation.py                # Splitters, metrics, and evaluation routine
 ├── 01_eda.ipynb                     # Exploratory data analysis
-├── 02_baseline.ipynb                 # Baseline models
-├── 03_ridge.ipynb                    # Ridge Regression experiments
-├── 04_random_forest.ipynb            # Random Forest experiments
-├── 05_gradient_boosting.ipynb         # HistGradientBoosting experiments
-├── 06_comparison_and_errors.ipynb     # Global comparison and error diagnostics
-├── requirements.txt                  # Python dependencies
-├── .gitignore
+├── 02_baseline.ipynb                # Baseline models
+├── 03_ridge.ipynb                   # Ridge Regression experiments
+├── 04_random_forest.ipynb           # Random Forest experiments
+├── 05_gradient_boosting.ipynb       # HistGradientBoosting experiments
+├── 06_comparison_and_errors.ipynb   # Global comparison and error diagnostics
+├── requirements.txt                 # Python dependencies
 └── README.md
 ```
-
-## 4. Experimental Design
-
-### Baseline Models
-
-Two simple reference models are used to establish a minimum level of predictive performance:
-
-1. **Constant baseline** — predicts the mean rental count observed in the training fold.
-2. **Hour × day-type baseline** — predicts the training-fold mean for the corresponding hour and day type, falling back to the training mean for unseen combinations.
-
-All baseline predictions are generated within the validation procedure so that test-fold information is not used to calculate the baseline predictions.
-
-### Candidate Models
-
-The project investigates three model families:
-
-| Model family | Experiment variants | Purpose |
-|---|---|---|
-| Ridge Regression | `ridge`, `ridge_log` | Regularised linear regression; the second variant uses a `log1p` transformation of the target. |
-| Random Forest | `rf` | Bagged decision trees that can capture nonlinear relationships and feature interactions. |
-| Histogram-based Gradient Boosting | `hgb`, `hgb_poisson` | Sequential tree boosting; the variants use squared-error and Poisson losses, respectively. |
-
-The two Ridge variants and the two Gradient Boosting variants are alternative configurations within the same model family, not additional model families.
-
-### Preprocessing
-
-Preprocessing is model-specific and is fitted within the training portion of each cross-validation fold:
-
-- **Ridge Regression:** uses a preprocessing pipeline with categorical encoding, numerical imputation and scaling, a quadratic temperature feature, and an hour-by-working-day interaction. The target-transformed variant applies `log1p` during fitting and transforms predictions back with `expm1`.
-- **Random Forest:** uses tree-based modelling without feature scaling or one-hot encoding; missing humidity values are imputed within the pipeline.
-- **HistGradientBoosting:** uses native handling of missing values and categorical features. Automatic early stopping is disabled so that an additional random internal validation split is not introduced into the time-ordered experiment.
-
-The exact transformations and parameter grids are documented in the corresponding model notebooks.
-
-## 5. Validation Strategy
-
-The shared implementation in `src/validation.py` provides three validation schemes:
-
-1. **Random K-Fold:** shuffled folds. Training data can contain observations later in time than observations in the test fold.
-2. **Blocked K-Fold:** contiguous test folds without shuffling. The training portion includes observations on both sides of a test block, so this is not a simulation of forecasting future observations.
-3. **Chronological expanding-window validation:** the initial training period covers the first 50% of the time span. The remaining time span is divided into five consecutive test periods of equal calendar duration. Each fold is trained only on observations earlier than its test period.
-
-For model experiments with hyperparameter tuning, an **outer evaluation loop** estimates performance and an **inner cross-validation loop** selects hyperparameters using only the outer training data. The outer test fold is not used during model selection. The outer loop uses five folds; the inner search uses three splits corresponding to the selected validation scheme.
-
-The chronological scheme is the primary evaluation setting for the intended future-demand prediction task. Random and blocked validation are retained to study how the validation design affects the estimated performance.
-
-The common evaluation code also checks feature/target index alignment and saves fold-level metrics and out-of-fold predictions. The random seed is set to `42` wherever applicable.
-
-## 6. Evaluation Metrics
-
-The experiments use four regression metrics:
-
-- **RMSE (Root Mean Squared Error):** measured in rentals per hour and penalises large errors more strongly. It is used as the primary hyperparameter-search metric.
-- **MAE (Mean Absolute Error):** average absolute prediction error, also measured in rentals per hour.
-- **R²:** compares the model with a mean-prediction reference in terms of explained variance.
-- **RMSLE (Root Mean Squared Logarithmic Error):** evaluates errors on a logarithmic scale and is useful for examining relative errors across different demand levels.
-
-Negative predictions are retained for RMSE, MAE, and R². For RMSLE only, negative predictions are clipped to zero before applying the logarithm; negative-prediction rates are therefore analysed separately.
-
-## 7. Results and Comparison
-
-The model-specific notebooks report each candidate's own fold-level results, selected hyperparameters, and error diagnostics. The global comparison notebook combines the saved results from all model families and baseline models.
-
-The global analysis is designed to include:
-
-- fold-averaged performance under each validation scheme;
-- a matched evaluation on the same chronological test timestamps (the 2012 observations evaluated by chronological validation);
-- the difference between random and chronological performance estimates;
-- variation in performance across chronological test periods;
-- residual and bias diagnostics, including peak versus off-peak demand.
-
-**Final quantitative results and model selection should be added here after the complete, clean execution of all notebooks.** Results from different validation schemes should not be interpreted as if they necessarily used identical training sets. In particular, random and blocked validation may use future observations relative to a test timestamp, unlike chronological validation.
 
 ## 8. Reproducing the Experiments
 
 Run the notebooks from the repository root so that imports such as `from src.data import load_data` resolve correctly.
 
-### Environment Setup
+### Environment setup
 
 Create and activate a virtual environment, then install the dependencies:
 
@@ -153,9 +188,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Run Order
-
-Execute the notebooks in this order:
+### Notebook execution order
 
 1. `01_eda.ipynb`
 2. `02_baseline.ipynb`
@@ -164,35 +197,25 @@ Execute the notebooks in this order:
 5. `05_gradient_boosting.ipynb`
 6. `06_comparison_and_errors.ipynb`
 
-The model notebooks save fold metrics and out-of-fold predictions in `results/`. The final comparison notebook reads these saved files and does not need to retrain the models.
+The model notebooks save fold metrics and out-of-fold predictions in `results/`. The final comparison notebook reads these saved files rather than retraining the models. Before running it, ensure that each of the seven model variants (the two baselines and five candidate variants) has generated its `*_folds.csv` and `*_preds.csv` files for all three validation schemes.
 
-Before running the global comparison, ensure that every model has generated both `*_folds.csv` and `*_preds.csv` files for all three validation schemes (`random`, `blocked`, and `chrono`).
-
-The `figures/` directory contains plots generated by the notebooks. These figures can be recreated by executing the relevant notebook cells.
+The figures can be recreated by executing the corresponding notebook cells.
 
 ## 9. Limitations
 
-The findings are limited by the available data and experimental design:
-
 - The dataset covers only two years and one city.
-- The main experiments exclude the year indicator and do not use lagged rental demand, so they cannot directly use recent demand history or explicitly encode the year-to-year change.
-- Chronological validation evaluates future periods within the observed dataset; it does not establish performance under arbitrary future structural changes.
-- Random and blocked validation are diagnostic comparisons, not realistic simulations of forecasting future observations.
-- The selected hyperparameters are limited to the grids explored in the model notebooks.
-- Error patterns and feature-importance analyses are descriptive and do not establish causal explanations for demand changes.
+- The main experiments exclude the year indicator and do not use lagged rental demand. Models therefore cannot directly use recent demand history or the explicit year label.
+- Chronological validation evaluates later periods within the observed dataset; it does not guarantee performance under future structural changes.
+- Random and blocked validation are diagnostic comparisons, not realistic simulations of predicting only future observations.
+- The selected hyperparameters are limited to the grids explored in the notebooks.
+- The outer cross-validation results are also used to compare the candidate model families. We do not have an additional, untouched final test set for a final independent estimate after choosing among all model families.
+- Error patterns and feature-importance analyses are descriptive and do not establish causal explanations.
 
 ## 10. AI-Use Disclosure
 
-> **Complete this section jointly before submission.** The course requires a disclosure of which AI tools were used, how they influenced the work, what code or analysis the project authors wrote or substantially changed, and what they independently verified and understood.
+Complete this section jointly before submission. The course requires an accurate disclosure of which AI tools were used, how they influenced the work, what code or analysis the project authors wrote or substantially changed, and what they independently verified and understood.
 
-Suggested points to document accurately:
-
-- Tools used and the tasks for which they were used (for example, conceptual explanations, code drafting, debugging, methodological review, interpretation of results, or editing documentation).
-- Whether AI suggestions influenced preprocessing, validation, model selection, metrics, or interpretation decisions.
-- Which code cells and analyses were written by the project authors, generated with assistance, or substantially modified by the authors.
-- Which outputs, assumptions, calculations, and code paths were independently checked by the project authors.
-
-The authors should only retain statements that accurately describe their actual use of AI tools and their own contributions.
+Document only what actually occurred, including relevant use for conceptual explanations, code drafting, debugging, methodological review, interpretation, or editing. Distinguish AI-assisted work from work written or substantially modified by the authors, and describe which outputs and assumptions were independently checked.
 
 ## 11. References
 
